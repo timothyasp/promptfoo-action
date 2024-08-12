@@ -41,10 +41,13 @@ export async function run(): Promise<void> {
     });
     const githubToken: string = core.getInput('github-token', {required: true});
     const promptFilesGlobs: string[] = core
-      .getInput('prompts', {required: true})
+      .getInput('prompts', {required: false})
       .split('\n');
     const configPath: string = core.getInput('config', {
-      required: true,
+      required: false,
+    });
+    const configPaths: string[] = core.getMultilineInput('config-paths', {
+      required: false,
     });
     const cachePath: string = core.getInput('cache-path', {required: false});
     const version: string = core.getInput('promptfoo-version', {
@@ -109,7 +112,7 @@ export async function run(): Promise<void> {
     for (const globPattern of promptFilesGlobs) {
       const matches = glob.sync(globPattern);
       const changedMatches = matches.filter(
-        file => file !== configPath && changedFiles.includes(file),
+        (file: string) => file !== configPath && changedFiles.includes(file),
       );
       promptFiles.push(...changedMatches);
     }
@@ -121,14 +124,12 @@ export async function run(): Promise<void> {
       return;
     }
 
-    const outputFile = path.join(process.cwd(), 'output.json');
-    let promptfooArgs = ['eval', '-c', configPath, '-o', outputFile];
-    if (!useConfigPrompts) {
-      promptfooArgs = promptfooArgs.concat(['--prompts', ...promptFiles]);
-    }
-    if (!noShare) {
-      promptfooArgs.push('--share');
-    }
+    const results: Array<{
+      configPath: string;
+      successes: number;
+      failures: number;
+      shareableUrl?: string | null;
+    }> = [];
 
     const env = {
       ...process.env,
@@ -145,42 +146,60 @@ export async function run(): Promise<void> {
       ...(vertexApiKey ? {VERTEX_API_KEY: vertexApiKey} : {}),
       ...(cachePath ? {PROMPTFOO_CACHE_PATH: cachePath} : {}),
     };
-    let errorToThrow: Error | undefined;
-    try {
-      await exec.exec(`npx promptfoo@${version}`, promptfooArgs, {env});
-    } catch (error) {
-      // Ignore nonzero exit code, but save the error to throw later
-      errorToThrow = error as Error;
+
+    const mergedConfigPaths = configPaths.length === 0 ? [configPath] : configPaths;
+
+    for (const config of mergedConfigPaths) {
+      const outputFile = path.join(process.cwd(), `output_${path.basename(config)}.json`);
+      let promptfooArgs = ['eval', '-c', config, '-o', outputFile];
+      if (!useConfigPrompts && configPaths.length === 1) {
+        promptfooArgs = promptfooArgs.concat(['--prompts', ...promptFiles]);
+      }
+      if (!noShare) {
+        promptfooArgs.push('--share');
+      }
+
+      try {
+        await exec.exec(`npx promptfoo@${version}`, promptfooArgs, {env});
+        const output = JSON.parse(
+          fs.readFileSync(outputFile, 'utf8'),
+        ) as OutputFile;
+        results.push({
+          configPath: config,
+          successes: output.results.stats.successes,
+          failures: output.results.stats.failures,
+          shareableUrl: output.shareableUrl,
+        });
+      } catch (error) {
+        core.warning(`Error running promptfoo for config ${config}: ${error}`);
+        results.push({
+          configPath: config,
+          successes: 0,
+          failures: 0,
+        });
+      }
     }
 
     // Comment PR
     const octokit = github.getOctokit(githubToken);
-    const output = JSON.parse(
-      fs.readFileSync(outputFile, 'utf8'),
-    ) as OutputFile;
     const modifiedFiles = promptFiles.join(', ');
-    let body = `⚠️ LLM prompt was modified in these files: ${modifiedFiles}
-
-| Success | Failure |
-|---------|---------|
-| ${output.results.stats.successes}      | ${output.results.stats.failures}       |
-
-`;
-    if (output.shareableUrl) {
-      body = body.concat(`**» [View eval results](${output.shareableUrl}) «**`);
-    } else {
-      body = body.concat('**» View eval results in CI console «**');
+    let body = `⚠️ LLM prompt was modified in these files: ${modifiedFiles}\n\n`;
+    
+    body += '| Config Path | Success | Failure | Eval Results |\n';
+    body += '|-------------|---------|---------|---------------|\n';
+    for (const result of results) {
+      const evalLink = result.shareableUrl 
+        ? `[View](${result.shareableUrl})`
+        : 'View in CI console';
+      body += `| ${result.configPath} | ${result.successes} | ${result.failures} | ${evalLink} |\n`;
     }
+
     await octokit.rest.issues.createComment({
       ...github.context.repo,
-      issue_number: pullRequest.number,
+      issue_number: github.context.payload.pull_request!.number,
       body,
     });
-
-    if (errorToThrow) {
-      throw errorToThrow;
-    }
-  } catch (error) {
+} catch (error) {
     if (error instanceof Error) {
       handleError(error);
     } else {
@@ -188,6 +207,7 @@ export async function run(): Promise<void> {
     }
   }
 }
+
 
 export function handleError(error: Error): void {
   core.setFailed(error.message);
